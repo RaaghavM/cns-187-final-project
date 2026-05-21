@@ -42,25 +42,47 @@ def gn_fn(n, th):
     return np.exp(log_g)
 
 
-# Pre-compute all basis functions: G[n, t]
-G = np.array([gn_fn(n, th) for n in range(N)])   # (N, T)
+# ── ODE simulation of pulse response for Fig 1B–E (Eq. 2) ───────
+def rk4_step_vec(drdt_fn, r: np.ndarray, dt_: float) -> np.ndarray:
+    k1 = drdt_fn(r)
+    k2 = drdt_fn(r + 0.5 * dt_ * k1)
+    k3 = drdt_fn(r + 0.5 * dt_ * k2)
+    k4 = drdt_fn(r + dt_ * k3)
+    return r + (dt_ / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
 
 
-# ── Pulse response (output = weighted sum of basis functions) ────
-out_pulse_eq = G.sum(axis=0)       # equal weights W_n = 1  → step ≈ 1
+def simulate_feedforward_pulse() -> np.ndarray:
+    """
+    Simulate the pulse response via Eq. 2: τ dR_n/dt = -R_n + R_{n-1}.
+    The unit impulse at t=0 is encoded as R_0(0)=1 (stage 0 decays freely
+    with no further input), yielding R_n(t) = g_n(t/τ) exactly in the limit
+    dt → 0.  Returns shape (N, T).
+    """
+    R = np.zeros((N, len(t)))
+    R[0, 0] = 1.0
 
-# Optimal weights, constrained |W_n| ≤ 5 (per paper)
+    def drdt(r: np.ndarray) -> np.ndarray:
+        out = np.empty_like(r)
+        out[0]  = -r[0] / tau
+        out[1:] = (-r[1:] + r[:-1]) / tau
+        return out
+
+    for k in range(len(t) - 1):
+        R[:, k + 1] = rk4_step_vec(drdt, R[:, k], dt)
+    return R
+
+
+G_sim = simulate_feedforward_pulse()   # (N, T)  R_n(t) ≈ g_n(t/τ)
+
+# ── Pulse and step responses from simulation ─────────────────────
 mask_fit = (t > 0) & (t <= N * tau)
-res      = lsq_linear(G[:, mask_fit].T,
-                      np.ones(mask_fit.sum()),
-                      bounds=(-5.0, 5.0))
-W_opt         = res.x
-out_pulse_opt = G.T @ W_opt
 
+out_pulse_eq_sim  = G_sim.sum(axis=0)
+res_sim           = lsq_linear(G_sim[:, mask_fit].T, np.ones(mask_fit.sum()), bounds=(-5.0, 5.0))
+out_pulse_opt_sim = G_sim.T @ res_sim.x
 
-# ── Step response = cumulative integral of pulse response ────────
-out_step_eq  = np.cumsum(out_pulse_eq)  * dt
-out_step_opt = np.cumsum(out_pulse_opt) * dt
+out_step_eq_sim  = np.cumsum(out_pulse_eq_sim)  * dt
+out_step_opt_sim = np.cumsum(out_pulse_opt_sim) * dt
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -103,13 +125,13 @@ ax_b_in.set_yticks([]); ax_b_in.set_xticks([])
 ax_b_in.set_ylabel("Input", fontsize=8)
 ax_b_in.text(0.4, 1.0, r"$\delta(t)$", fontsize=10, va='bottom')
 
-# Basis functions (select evenly-spaced n)
+# Basis functions from ODE simulation (select evenly-spaced n)
 n_vals = list(range(1, 85, 7))   # n = 1, 8, 15, 22, ...
 cmap_b = plt.cm.rainbow
 for i, n in enumerate(n_vals):
     c = cmap_b(i / (len(n_vals) - 1))
-    ax_b_fn.plot(t, G[n], color=c, lw=1.1, alpha=0.9)
-ax_b_fn.set_ylabel("Basis fns $g_n$", fontsize=8)
+    ax_b_fn.plot(t, G_sim[n], color=c, lw=1.1, alpha=0.9)
+ax_b_fn.set_ylabel("Stage activity $R_n$", fontsize=8)
 ax_b_fn.set_xlim([0, 15]); ax_b_fn.set_ylim([0, 0.45])
 ax_b_fn.set_xticks([])
 ax_b_fn.text(0.97, 0.93, r"$n = 1, 8, 15, 22, \ldots$",
@@ -117,9 +139,9 @@ ax_b_fn.text(0.97, 0.93, r"$n = 1, 8, 15, 22, \ldots$",
              fontsize=7.5, color='dimgray',
              bbox=dict(fc='white', ec='none', alpha=0.7))
 
-# Output: weighted sum
-ax_b_out.plot(t, out_pulse_eq,  'k-',  lw=2.0, label="W's = 1")
-ax_b_out.plot(t, out_pulse_opt, 'r-',  lw=1.5, label="W's optimally fit")
+# Output: weighted sum of simulated stage activities
+ax_b_out.plot(t, out_pulse_eq_sim,  'k-',  lw=2.0, label="W's = 1")
+ax_b_out.plot(t, out_pulse_opt_sim, 'r-',  lw=1.5, label="W's optimally fit")
 ax_b_out.axhline(1.0, color='gray', ls='--', lw=0.8, alpha=0.6)
 ax_b_out.set_xlim([0, 15]); ax_b_out.set_ylim([-0.05, 1.4])
 ax_b_out.set_xlabel("Time (sec)", fontsize=8)
@@ -169,7 +191,7 @@ ax_d_in.set_yticks([]); ax_d_in.set_xticks([])
 ax_d_in.set_ylabel("Input", fontsize=8)
 
 for amp, c, lbl in zip(amps, colors_d, labels_d):
-    ax_d_out.plot(t, amp * out_pulse_eq, color=c, lw=2, label=lbl)
+    ax_d_out.plot(t, amp * out_pulse_eq_sim, color=c, lw=2, label=lbl)
 ax_d_out.set_xlim([0, 15]); ax_d_out.set_ylim([-0.05, 2.6])
 ax_d_out.set_xlabel("Time (sec)", fontsize=8)
 ax_d_out.set_ylabel("Output $r_{out}$", fontsize=8)
@@ -188,8 +210,8 @@ ax_e_in.set_ylabel("Input", fontsize=8)
 ax_e_in.text(7, 1.1, "Step", fontsize=9, ha='center')
 
 # Ramp output
-ax_e_out.plot(t, out_step_eq,  'k-', lw=2.0, label="W's = 1")
-ax_e_out.plot(t, out_step_opt, 'r-', lw=1.5, label="W's optimally fit")
+ax_e_out.plot(t, out_step_eq_sim,  'k-', lw=2.0, label="W's = 1")
+ax_e_out.plot(t, out_step_opt_sim, 'r-', lw=1.5, label="W's optimally fit")
 ax_e_out.set_xlim([0, 15])
 ax_e_out.set_xlabel("Time (sec)", fontsize=8)
 ax_e_out.set_ylabel("Output $r_{out}$", fontsize=8)
