@@ -4,20 +4,18 @@ Pulse-to-step integration with four mistuning levels.
 
 Line attractor
 --------------
-N-neuron mean-field generalization of the reduced averaged autapse from
-Seung et al. (2000), following the implementation style of
-reduced_autapse_line_attractor.py.
-
+Rank-1 network: w_ij = b_i * c_j, with b·c = 1 + epsilon.
 Each neuron obeys:
-    tau dr_i/dt = -r_i + (1+epsilon) * mean(r)
+    tau dr_i/dt = -r_i + b_i * (c · r)
 
-This is the N-neuron extension of the single autapse with W = (1+epsilon).
-Decomposing into mean m = mean(r) and deviations delta_i = r_i - m:
-    tau dm/dt      = epsilon * m      [slow mode — persists / decays / grows]
-    tau d(delta)/dt = -delta           [fast modes — decay in one time constant]
+The scalar memory s = c·r satisfies tau ds/dt = epsilon * s — identical
+to the Seung autapse.  The N-1 fast eigenmodes (eigenvalue -1/tau) decay
+within a few tau, leaving only the slow eigenmode visible at long times.
+Neurons converge to different persistent amplitudes b_i while all
+tracking the same slow eigenvalue epsilon/tau.
 
-So all neurons converge to the same temporal pattern after a few tau,
-leaving only the single slow eigenmode visible at long times.
+Pulse initialization: r_i(0) = a_i (random, c·a = 1+epsilon) so the
+summed output equals 1 at convergence for epsilon=0.
 
 Feedforward network
 -------------------
@@ -60,39 +58,49 @@ def rk4_step(f, y: np.ndarray, dt: float) -> np.ndarray:
 # ── Line attractor simulation ─────────────────────────────────────────────────
 def simulate_line_attractor(
     epsilon: float, seed: int = 42
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray]:
     """
-    Simulate the N-neuron line attractor with bipolar initial conditions.
+    Simulate the rank-1 line attractor with pulse initialization.
 
-    Half the neurons start at +3, the other half at -1, giving mean(r0) = 1.
-    This makes the convergence of diverse neurons onto a common trajectory
-    clearly visible — matching Goldman Fig. 7A-D.
+    Connectivity: w_ij = b_i * c_j, with b·c = 1 + epsilon.
+    Dynamics:     tau dr_i/dt = -r_i + b_i * (c · r)
+
+    The scalar memory s = c·r obeys tau ds/dt = epsilon * s — identical to
+    the Seung autapse.  The N-1 fast eigenmodes (eigenvalue -1/tau) decay
+    within a few tau; afterwards each neuron tracks b_i * exp(epsilon*t/tau).
+
+    Pulse initial condition: r_i(0) = a_i (random, independent of b),
+    normalized so c·a = 1+epsilon.  This ensures sum(r) → 1 for epsilon=0
+    after the fast transient, while keeping a_i ≠ b_i so the convergence
+    is visible — neurons start at different heights and settle to b_i.
 
     Returns
     -------
-    R       : (N, T) firing-rate array (ms time axis)
-    idx_high: indices of neurons that start at +3
-    idx_low : indices of neurons that start at -1
+    R : (N, T) firing-rate array
+    b : (N,)  slow-mode weights (persistent amplitude of each neuron)
     """
-    rng      = np.random.default_rng(seed)
-    idx_high = rng.choice(N, N // 2, replace=False)
-    idx_low  = np.setdiff1d(np.arange(N), idx_high)
+    rng = np.random.default_rng(seed)
 
-    r0           = np.empty(N)
-    r0[idx_high] = 3.0
-    r0[idx_low]  = -1.0          # mean(r0) = (50×3 + 50×(−1))/100 = 1
+    b = np.abs(rng.standard_normal(N)) + 0.1
+    b /= b.sum()                             # sum(b) = 1
 
-    W_eff = 1.0 + epsilon
+    c_vec = np.abs(rng.standard_normal(N)) + 0.1
+    c_vec *= (1.0 + epsilon) / (b @ c_vec)   # b·c = 1 + epsilon
+
+    # Random pulse: normalize so c·a = 1+epsilon
+    # → slow-mode coefficient α = c·a/(1+ε) = 1 → sum(r) → 1 after convergence
+    a = np.abs(rng.standard_normal(N)) + 0.1
+    a *= (1.0 + epsilon) / (c_vec @ a)
 
     def drdt(r: np.ndarray) -> np.ndarray:
-        return (-r + W_eff * r.mean()) / tau
+        return (-r + b * (c_vec @ r)) / tau
 
-    R        = np.zeros((N, len(t_ms)))
-    R[:, 0]  = r0
+    R       = np.zeros((N, len(t_ms)))
+    R[:, 0] = a
     for k in range(len(t_ms) - 1):
         R[:, k + 1] = rk4_step(drdt, R[:, k], dt_ms)
 
-    return R, idx_high, idx_low
+    return R, b
 
 
 # ── Feedforward basis functions ───────────────────────────────────────────────
@@ -109,18 +117,20 @@ def gn_fn(n: int, th: np.ndarray) -> np.ndarray:
 
 def compute_feedforward_G(epsilon: float) -> np.ndarray:
     """
-    Mistuned basis functions: G[n, t] = (1+epsilon)^n * g_n(t/tau).
-
-    For epsilon=0 this reduces to the standard feedforward chain.
-    For epsilon != 0 each stage n is amplified (epsilon>0) or attenuated
-    (epsilon<0) by the cumulative weight factor (1+epsilon)^n, so later
-    stages are affected most.
+    Numerically integrate tau dG_n/dt = -G_n + (1+epsilon)*G_{n-1}.
+    Delta-pulse initial condition: G[0,0] = 1, all others 0.
+    Uses exact piecewise-constant (ZOH) step for accuracy across all N stages.
     """
-    th = t_ms / tau          # dimensionless t̂ (same tau as line attractor)
-    w  = 1.0 + epsilon
-    G  = np.zeros((N, len(t_ms)))
-    for n in range(N):
-        G[n] = (w ** n) * gn_fn(n, th)
+    G     = np.zeros((N, len(t_ms)))
+    decay = np.exp(-dt_ms / tau)
+    rise  = 1.0 - decay
+    w     = 1.0 + epsilon
+    G[0, 0] = 1.0                      # delta-pulse IC
+    for k in range(len(t_ms) - 1):
+        src    = np.empty(N)
+        src[0] = 0.0                   # no external input after t = 0
+        src[1:] = w * G[:N-1, k]
+        G[:, k+1] = decay * G[:, k] + rise * src
     return G
 
 
@@ -133,7 +143,7 @@ cases = [
 ]
 
 # Optimal readout: constrained least squares fit to unit step over 0–2 s
-T_target_ms = 2_000.0
+T_target_ms = T_ms
 mask_fit    = (t_ms > 0) & (t_ms <= T_target_ms)
 b_fit       = np.ones(mask_fit.sum())
 
@@ -141,10 +151,10 @@ b_fit       = np.ones(mask_fit.sum())
 print("Simulating…")
 results = []
 for _, _, epsilon in cases:
-    R_la, idx_high, idx_low = simulate_line_attractor(epsilon)
+    R_la, b_la   = simulate_line_attractor(epsilon)
     G_ff  = compute_feedforward_G(epsilon)
     res   = lsq_linear(G_ff[:, mask_fit].T, b_fit, bounds=(-5.0, 5.0))
-    results.append((R_la, idx_high, idx_low, G_ff, res.x))
+    results.append((R_la, b_la, G_ff, res.x))
     print(f"  epsilon={epsilon:+.3f}  done")
 
 # ── Figure ────────────────────────────────────────────────────────────────────
@@ -184,7 +194,7 @@ def decorate_output(ax, ylim=None):
 
 N_SHOW_EACH = 3   # neurons shown from each bipolar group
 
-for col, ((label, title, epsilon), (R_la, idx_high, idx_low, G_ff, W_opt)) in enumerate(
+for col, ((label, title, epsilon), (R_la, b_la, G_ff, W_opt)) in enumerate(
     zip(cases, results)
 ):
     # ── Line attractor ────────────────────────────────────────────────────────
@@ -194,15 +204,14 @@ for col, ((label, title, epsilon), (R_la, idx_high, idx_low, G_ff, W_opt)) in en
     ax_la_r = fig.add_subplot(gs_sub_la[0])
     ax_la_o = fig.add_subplot(gs_sub_la[1])
 
-    # Show N_SHOW_EACH neurons from each group (high=dark blue, low=light blue)
-    for i, ni in enumerate(idx_high[:N_SHOW_EACH]):
-        c = plt.cm.Blues(0.75 + 0.2 * i / max(N_SHOW_EACH - 1, 1))
-        ax_la_r.plot(t_s, R_la[ni], color=c, lw=0.9, alpha=0.9)
-    for i, ni in enumerate(idx_low[:N_SHOW_EACH]):
-        c = plt.cm.Blues(0.30 + 0.2 * i / max(N_SHOW_EACH - 1, 1))
-        ax_la_r.plot(t_s, R_la[ni], color=c, lw=0.9, alpha=0.9)
+    # Show N_SHOW_EACH*2 neurons spanning the full b_la amplitude range
+    idx_sorted = np.argsort(b_la)[::-1]
+    idx_show   = idx_sorted[np.linspace(0, N - 1, N_SHOW_EACH * 2, dtype=int)]
+    for i, ni in enumerate(idx_show):
+        shade = 0.35 + 0.55 * i / (N_SHOW_EACH * 2 - 1)
+        ax_la_r.plot(t_s, R_la[ni], color=plt.cm.Blues(shade), lw=0.9, alpha=0.9)
 
-    out_la = R_la.mean(axis=0)         # mean firing rate (starts at 1, evolves as exp(ε t/τ))
+    out_la = R_la.sum(axis=0)          # summed output: → exp(ε t/τ) after convergence
     ax_la_o.plot(t_s, out_la, color='steelblue', lw=2)
 
     ylim_la = [-0.05, 5.5] if epsilon > 0 else [-0.05, 1.35]
@@ -210,7 +219,8 @@ for col, ((label, title, epsilon), (R_la, idx_high, idx_low, G_ff, W_opt)) in en
 
     ax_la_r.set_title(title, fontsize=9, pad=3)
     ax_la_r.set_xlim([0, T_ms / 1000])
-    ax_la_r.set_ylim([-1.5, 3.5] if epsilon <= 0 else [-1.5, 6.0])
+    shown_max = np.array([R_la[ni] for ni in idx_show]).max()
+    ax_la_r.set_ylim([0, shown_max * 1.2])
     ax_la_r.set_xticks([])
     ax_la_r.tick_params(labelsize=7)
     if col == 0:
